@@ -1549,10 +1549,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if topic_rm is False:
             return True
         if topic_rm is True:
-            # Topic explicitly requires mention — fall through to mention checks below
+            # Topic explicitly requires mention — skip free_response_chats override
             pass
-
-        if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
+        elif str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
             return True
         if not self._telegram_require_mention():
             return True
@@ -2153,12 +2152,17 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_topic = created_name
 
         # Resolve supergroup topic name and skill binding
+        topic_personality = None
         if chat_type == "group" and thread_id_str:
             topic_info = self._get_supergroup_topic_info(str(chat.id), thread_id_str)
             if topic_info:
                 chat_topic = topic_info.get("name")
                 topic_skill = topic_info.get("skill")
                 topic_personality = topic_info.get("personality")
+
+        # DMs default to marvin personality unless explicitly configured
+        if chat_type == "dm" and topic_personality is None:
+            topic_personality = "marvin"
 
         # Build source
         source = self.build_source(

@@ -69,6 +69,26 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
+def test_commands_in_free_response_thread_accepted():
+    """Agent assigned to thread accepts commands without mention."""
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200:10"])
+    msg = SimpleNamespace(
+        **_group_message("/model", chat_id=-200).__dict__,
+        message_thread_id=10,
+    )
+    assert adapter._should_process_message(msg, is_command=True) is True
+
+
+def test_commands_in_foreign_free_response_thread_rejected():
+    """Agent with free_response_chats configured for a different thread rejects commands in unassigned thread."""
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200:99"])
+    msg = SimpleNamespace(
+        **_group_message("/model", chat_id=-200).__dict__,
+        message_thread_id=10,
+    )
+    assert adapter._should_process_message(msg, is_command=True) is False
+
+
 def test_regex_mention_patterns_allow_custom_wake_words():
     adapter = _make_adapter(require_mention=True, mention_patterns=[r"^\s*chompy\b"])
 

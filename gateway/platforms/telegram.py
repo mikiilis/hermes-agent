@@ -28,6 +28,10 @@ try:
     )
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
+    try:
+        from telegram import ReactionTypeEmoji
+    except ImportError:
+        ReactionTypeEmoji = None
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
@@ -44,6 +48,7 @@ except ImportError:
     filters = None
     ParseMode = None
     ChatType = None
+    ReactionTypeEmoji = None
 
     # Mock ContextTypes so type annotations using ContextTypes.DEFAULT_TYPE
     # don't crash during class definition when the library isn't installed.
@@ -151,6 +156,34 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
+        # Read receipt reaction — show this emoji on user messages as soon as the
+        # agent starts processing (overridden handle_message triggers this).
+        self._read_reaction: str = self.config.extra.get("read_reaction", "👀")
+
+    async def _ack_read_event(self, event: "MessageEvent") -> None:
+        """Set a read-receipt reaction on the user's message when processing begins.
+
+        Uses event.raw_message (the Telegram Message object) to get chat_id and
+        message_id, so this works regardless of how the event was constructed
+        (text batching, photo batching, media groups, stickers, etc.).
+        """
+        raw = event.raw_message
+        if not raw or not self._bot or not ReactionTypeEmoji:
+            return
+        try:
+            await self._bot.set_message_reaction(
+                chat_id=raw.chat_id,
+                message_id=raw.message_id,
+                reaction=[ReactionTypeEmoji(emoji=self._read_reaction)],
+            )
+        except Exception as e:
+            logger.debug("[%s] Failed to set read reaction: %s", self.name, e)
+
+    async def handle_message(self, event: "MessageEvent") -> None:
+        """Override to set 👀 read-reaction before the agent starts processing."""
+        # Fire the read reaction right before the agent picks up the message
+        await self._ack_read_event(event)
+        await super().handle_message(event)
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -1917,6 +1950,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Maximum: 20 MB."
                     )
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
+                    await self._ack_read(update)
                     await self.handle_message(event)
                     return
 
@@ -1953,12 +1987,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
-            await self._queue_media_group_event(str(media_group_id), event)
+            await self._queue_media_group_event(str(media_group_id), event, update)
             return
 
+        await self._ack_read(update)
         await self.handle_message(event)
     
-    async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
+    async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent, update: Optional[Update] = None) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
 
         Telegram delivers albums as multiple updates with a shared media_group_id.
@@ -1979,6 +2014,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 else:
                     existing.text = event.text
 
+        # Store Update for later ack
+        if update is not None:
+            self._store_update_for_ack(media_group_id, update)
+
         prior_task = self._media_group_tasks.get(media_group_id)
         if prior_task:
             prior_task.cancel()
@@ -1992,6 +2031,9 @@ class TelegramAdapter(BasePlatformAdapter):
             await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
             event = self._media_group_events.pop(media_group_id, None)
             if event is not None:
+                update = self._take_update_for_ack(media_group_id)
+                if update:
+                    await self._ack_read(update)
                 await self.handle_message(event)
         except asyncio.CancelledError:
             return

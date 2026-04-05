@@ -28,7 +28,7 @@ def _make_adapter(require_mention=None, free_response_chats=None, mention_patter
     return adapter
 
 
-def _group_message(text="hello", *, chat_id=-100, reply_to_bot=False, entities=None, caption=None, caption_entities=None):
+def _group_message(text="hello", *, chat_id=-100, message_thread_id=None, reply_to_bot=False, entities=None, caption=None, caption_entities=None):
     reply_to_message = None
     if reply_to_bot:
         reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999))
@@ -39,6 +39,7 @@ def _group_message(text="hello", *, chat_id=-100, reply_to_bot=False, entities=N
         caption_entities=caption_entities or [],
         chat=SimpleNamespace(id=chat_id, type="group"),
         reply_to_message=reply_to_message,
+        message_thread_id=message_thread_id,
     )
 
 
@@ -67,6 +68,14 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_free_response_chats_specific_thread_bypass_mention_requirement():
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200:15"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, message_thread_id=15)) is True
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, message_thread_id=16)) is False
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
 
 
 def test_regex_mention_patterns_allow_custom_wake_words():

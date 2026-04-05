@@ -1605,7 +1605,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._is_group_chat(message):
             return True
-        if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = str(getattr(message, "message_thread_id", "")) if getattr(message, "message_thread_id", None) else ""
+        allowed = self._telegram_free_response_chats()
+        if chat_id in allowed or (thread_id and f"{chat_id}:{thread_id}" in allowed):
             return True
         if not self._telegram_require_mention():
             return True

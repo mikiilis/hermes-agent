@@ -3485,7 +3485,7 @@ class GatewayRunner:
                 else:
                     cfg = {}
                 model_cfg = cfg.setdefault("model", {})
-                model_cfg["name"] = result.new_model
+                model_cfg["default"] = result.new_model
                 model_cfg["provider"] = result.target_provider
                 if result.base_url:
                     model_cfg["base_url"] = result.base_url

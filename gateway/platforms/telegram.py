@@ -122,7 +122,7 @@ class TelegramAdapter(BasePlatformAdapter):
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     MEDIA_GROUP_WAIT_SECONDS = 0.8
-    
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
@@ -151,6 +151,15 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
+
+        # Interactive model selection page sizes
+        model_command_cfg = self.config.extra.get("model_command", {})
+        if not isinstance(model_command_cfg, dict):
+            model_command_cfg = {}
+        self._providers_per_page = int(model_command_cfg.get("providers_per_page", 6))
+        self._models_per_page = int(model_command_cfg.get("models_per_page", 8))
+        # State dict for in-flight interactive model selection sessions
+        self._model_selector_state: Dict[str, Dict] = {}
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -181,6 +190,32 @@ class TelegramAdapter(BasePlatformAdapter):
         except ImportError:
             pass
         return isinstance(error, OSError)
+
+    @staticmethod
+    def _page_count(total: int, page_size: int) -> int:
+        """Return the number of pages needed to display `total` items at `page_size` per page."""
+        return max(1, (total + page_size - 1) // page_size)
+
+    @staticmethod
+    def _selector_key(chat_id: str, thread_id: Optional[str]) -> str:
+        """Return the state-dict key for a model selector session."""
+        return f"{chat_id}:{thread_id or ''}"
+
+    @staticmethod
+    def _msg_thread_id(msg) -> Optional[str]:
+        """Extract the message thread ID as a string, or None if absent."""
+        return str(msg.message_thread_id) if getattr(msg, "message_thread_id", None) else None
+
+    def _build_nav_row(self, page: int, total_pages: int, prev_data: str, next_data: str) -> list:
+        """Return a [Prev, Next] button row for paginated keyboards; empty list on single page."""
+        if total_pages <= 1:
+            return []
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀ Prev", callback_data=prev_data))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("Next ▶", callback_data=next_data))
+        return nav_row
 
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
@@ -1008,6 +1043,337 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+
+    def _build_provider_keyboard(
+        self,
+        providers_all: list,
+        page: int,
+        current_model: str,
+        current_provider: str,
+    ) -> tuple:
+        """Return (header, InlineKeyboardMarkup) for the provider selection page."""
+        from hermes_cli.providers import get_label
+        total = len(providers_all)
+        total_pages = self._page_count(total, self._providers_per_page)
+        page = max(0, min(page, total_pages - 1))
+        page_providers = providers_all[page * self._providers_per_page:(page + 1) * self._providers_per_page]
+
+        provider_label = get_label(current_provider) if current_provider else "none"
+        header = f"Current: `{current_model or 'unknown'}` on {provider_label}\n\nSelect a provider:"
+
+        buttons = [
+            InlineKeyboardButton(f"{p['name']}{' ✓' if p['is_current'] else ''}", callback_data=f"mdl:p:{p['slug']}")
+            for p in page_providers
+        ]
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+
+        nav_row = self._build_nav_row(page, total_pages, "mdl:providers:prev", "mdl:providers:next")
+        if nav_row:
+            rows.append(nav_row)
+
+        rows.append([
+            InlineKeyboardButton("✏ Enter manually", callback_data="mdl:manual"),
+            InlineKeyboardButton("✗ Cancel", callback_data="mdl:cancel"),
+        ])
+        return header, InlineKeyboardMarkup(rows)
+
+    async def send_model_selector(
+        self,
+        chat_id: str,
+        thread_id: Optional[str],
+        current_model: str,
+        current_provider: str,
+        providers: list,
+    ) -> None:
+        """Send an inline keyboard for interactive model selection."""
+        if not self._bot:
+            return
+
+        state_key = self._selector_key(chat_id, thread_id)
+        self._model_selector_state[state_key] = {
+            "current_model": current_model,
+            "current_provider": current_provider,
+            "providers_page": 0,
+            "models_page": 0,
+            "models_provider": "",
+            "providers": providers,
+        }
+
+        header, keyboard = self._build_provider_keyboard(providers, 0, current_model, current_provider)
+        await self._bot.send_message(
+            chat_id=int(chat_id),
+            text=header,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+            message_thread_id=int(thread_id) if thread_id else None,
+        )
+
+    async def _build_model_keyboard(
+        self, provider_slug: str, current_model: str, current_provider: str,
+        page: int = 0, state: Optional[dict] = None,
+    ) -> tuple:
+        """Return (text, InlineKeyboardMarkup) for the model list of a provider, paginated."""
+        _back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀ Back", callback_data="mdl:back:providers")]])
+        providers = state.get("providers") if state else None
+        if providers is None:
+            from hermes_cli.model_switch import list_authenticated_providers
+            try:
+                providers = list_authenticated_providers(
+                    current_provider=current_provider,
+                    max_models=None,
+                )
+            except Exception as e:
+                return f"Failed to load providers: {e}", _back_kb
+
+        provider = next((p for p in providers if p["slug"] == provider_slug), None)
+        if not provider:
+            return f"Provider `{provider_slug}` not found or no longer authenticated.", _back_kb
+
+        model_ids = provider["models"]
+        total_models = len(model_ids)
+        total_pages = self._page_count(total_models, self._models_per_page)
+        page = max(0, min(page, total_pages - 1))
+        page_models = model_ids[page * self._models_per_page:(page + 1) * self._models_per_page]
+
+        page_info = f" (page {page + 1}/{total_pages})" if total_pages > 1 else ""
+        text = f"Provider: *{provider['name']}*\n\nSelect a model{page_info}:"
+
+        rows = []
+        for model_id in page_models:
+            marker = " ✓" if (model_id == current_model and provider_slug == current_provider) else ""
+            rows.append([InlineKeyboardButton(
+                f"{model_id}{marker}",
+                callback_data=f"mdl:m:{provider_slug}:{model_id}",
+            )])
+
+        nav_row = self._build_nav_row(page, total_pages, "mdl:models:prev", "mdl:models:next")
+        if nav_row:
+            rows.append(nav_row)
+
+        rows.append([
+            InlineKeyboardButton("◀ Back", callback_data="mdl:back:providers"),
+            InlineKeyboardButton("✏ Enter manually", callback_data="mdl:manual:model"),
+            InlineKeyboardButton("✗ Cancel", callback_data="mdl:cancel"),
+        ])
+        return text, InlineKeyboardMarkup(rows)
+
+    def _build_scope_keyboard(self, provider_slug: str, model_id: str, back_target: str = "mdl:back:models") -> tuple:
+        """Return (text, InlineKeyboardMarkup) for the session/global scope choice."""
+        if provider_slug:
+            from hermes_cli.providers import get_label
+            provider_label = get_label(provider_slug)
+            text = f"Switch to `{model_id}` on {provider_label}?"
+        else:
+            text = f"Switch to `{model_id}`?"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("This session", callback_data=f"mdl:s:{provider_slug}:{model_id}"),
+            InlineKeyboardButton("Global (persist)", callback_data=f"mdl:g:{provider_slug}:{model_id}"),
+        ], [
+            InlineKeyboardButton("◀ Back", callback_data=back_target),
+            InlineKeyboardButton("✗ Cancel", callback_data="mdl:cancel"),
+        ]])
+        return text, keyboard
+
+    async def _safe_edit(
+        self,
+        query,
+        text: str,
+        parse_mode=None,
+        reply_markup=None,
+        chat_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> None:
+        """Edit a callback message with standard error recovery.
+
+        Swallows double-click ("not modified") silently.
+        On stale message ("not found"/"bad request"), sends a fresh fallback if chat_id given.
+        Other errors logged at WARNING.
+        """
+        try:
+            await query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        except Exception as e:
+            err = str(e).lower()
+            if "message is not modified" in err:
+                return
+            if ("message to edit not found" in err or "bad request" in err) and chat_id:
+                try:
+                    await self._bot.send_message(
+                        chat_id=int(chat_id),
+                        text="Model selection expired. Send `/model` to start again.",
+                        parse_mode=ParseMode.MARKDOWN,
+                        message_thread_id=int(thread_id) if thread_id else None,
+                    )
+                except Exception:
+                    pass
+            else:
+                logger.warning("[%s] edit message error: %s", self.name, e)
+
+    async def _mdl_cancel(
+        self, query, state_key: str, chat_id: str, thread_id: Optional[str]
+    ) -> None:
+        """Handle mdl:cancel — dismiss the selector and clear state."""
+        await self._safe_edit(query, "Model selection cancelled.", reply_markup=None,
+                              chat_id=chat_id, thread_id=thread_id)
+        self._model_selector_state.pop(state_key, None)
+
+    async def _mdl_request_manual_input(
+        self, query, state: dict, input_type: str, chat_id: str, thread_id: Optional[str]
+    ) -> None:
+        """Handle mdl:manual and mdl:manual:model — prompt for free-text model entry."""
+        state["awaiting_manual_input"] = True
+        state["manual_input_type"] = input_type
+        if input_type == "provider_model":
+            prompt = "Type the model in format `provider:model`:"
+        else:
+            provider_slug = state.get("models_provider", "")
+            prompt = "Type the model name to use"
+            if provider_slug:
+                prompt += f" with *{provider_slug}*"
+            prompt += ":"
+        await self._safe_edit(query, prompt, parse_mode=ParseMode.MARKDOWN, reply_markup=None,
+                              chat_id=chat_id, thread_id=thread_id)
+
+    async def _mdl_navigate_providers(
+        self,
+        query,
+        state: dict,
+        data: str,
+        current_model: str,
+        current_provider: str,
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> None:
+        """Handle mdl:back:providers, mdl:providers:prev, mdl:providers:next."""
+        providers_all = state.get("providers") or []
+        page = state.get("providers_page", 0)
+        if data == "mdl:providers:prev":
+            page = max(0, page - 1)
+        elif data == "mdl:providers:next":
+            total_pages = self._page_count(len(providers_all), self._providers_per_page)
+            page = min(total_pages - 1, page + 1)
+        state["providers_page"] = page
+        header, keyboard = self._build_provider_keyboard(providers_all, page, current_model, current_provider)
+        await self._safe_edit(query, header, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
+                              chat_id=chat_id, thread_id=thread_id)
+
+    async def _mdl_select_provider(
+        self,
+        query,
+        state: dict,
+        provider_slug: str,
+        current_model: str,
+        current_provider: str,
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> None:
+        """Handle mdl:p:<slug> — show model list for the chosen provider."""
+        state["models_provider"] = provider_slug
+        state["models_page"] = 0
+        text, kb = await self._build_model_keyboard(provider_slug, current_model, current_provider, 0, state)
+        await self._safe_edit(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+                              chat_id=chat_id, thread_id=thread_id)
+
+    async def _mdl_navigate_models(
+        self,
+        query,
+        state: dict,
+        data: str,
+        current_model: str,
+        current_provider: str,
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> None:
+        """Handle mdl:back:models, mdl:models:prev, mdl:models:next."""
+        provider_slug = state.get("models_provider", "")
+        page = state.get("models_page", 0)
+        if data == "mdl:models:prev":
+            page = max(0, page - 1)
+        elif data == "mdl:models:next":
+            page = page + 1
+        state["models_page"] = page
+        text, kb = await self._build_model_keyboard(provider_slug, current_model, current_provider, page, state)
+        await self._safe_edit(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+                              chat_id=chat_id, thread_id=thread_id)
+
+    async def _mdl_select_model(
+        self, query, data: str, chat_id: str, thread_id: Optional[str]
+    ) -> None:
+        """Handle mdl:m:<provider>:<model> — show scope confirmation keyboard."""
+        parts = data[len("mdl:m:"):].split(":", 1)
+        if len(parts) != 2:
+            logger.error("[%s] Malformed mdl:m: callback data: %r", self.name, data)
+            await query.answer("Invalid model selection data.", show_alert=True)
+            return
+        provider_slug, model_id = parts
+        text, kb = self._build_scope_keyboard(provider_slug, model_id)
+        await self._safe_edit(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
+                              chat_id=chat_id, thread_id=thread_id)
+
+    async def _mdl_confirm_switch(
+        self,
+        query,
+        state_key: str,
+        is_global: bool,
+        provider_slug: str,
+        model_id: str,
+        chat_id: str,
+        thread_id: Optional[str],
+    ) -> None:
+        """Handle mdl:s:* / mdl:g:* — synthesize /model command and execute it."""
+        from gateway.session import SessionSource
+        cmd = f"/model {model_id}"
+        if provider_slug:
+            cmd += f" --provider {provider_slug}"
+        if is_global:
+            cmd += " --global"
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=str(query.from_user.id) if query.from_user else None,
+            user_name=getattr(query.from_user, "username", None) if query.from_user else None,
+        )
+        synth_event = MessageEvent(text=cmd, source=source)
+        try:
+            result = await self._message_handler(synth_event)
+            result_text = str(result) if result else "Model switched."
+        except Exception as exc:
+            result_text = f"Error switching model: {exc}"
+        await self._safe_edit(query, result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=None,
+                              chat_id=chat_id, thread_id=thread_id)
+        self._model_selector_state.pop(state_key, None)
+
+    async def _handle_model_callback(self, query) -> None:
+        """Dispatch mdl:* callback data for the model selector flow."""
+        await query.answer()
+        data = query.data
+        msg = query.message
+        chat_id = str(msg.chat_id)
+        thread_id = self._msg_thread_id(msg)
+        state_key = self._selector_key(chat_id, thread_id)
+        state = self._model_selector_state.get(state_key, {})
+        current_model = state.get("current_model", "")
+        current_provider = state.get("current_provider", "")
+
+        if data == "mdl:cancel":
+            await self._mdl_cancel(query, state_key, chat_id, thread_id)
+        elif data in ("mdl:manual", "mdl:manual:model"):
+            input_type = "provider_model" if data == "mdl:manual" else "model_only"
+            await self._mdl_request_manual_input(query, state, input_type, chat_id, thread_id)
+        elif data in ("mdl:back:providers", "mdl:providers:prev", "mdl:providers:next"):
+            await self._mdl_navigate_providers(query, state, data, current_model, current_provider, chat_id, thread_id)
+        elif data.startswith("mdl:p:"):
+            await self._mdl_select_provider(query, state, data[len("mdl:p:"):], current_model, current_provider, chat_id, thread_id)
+        elif data in ("mdl:back:models", "mdl:models:prev", "mdl:models:next"):
+            await self._mdl_navigate_models(query, state, data, current_model, current_provider, chat_id, thread_id)
+        elif data.startswith("mdl:m:"):
+            await self._mdl_select_model(query, data, chat_id, thread_id)
+        elif data.startswith(("mdl:s:", "mdl:g:")):
+            is_global = data.startswith("mdl:g:")
+            parts = data[6:].split(":", 1)
+            if len(parts) == 2:
+                await self._mdl_confirm_switch(query, state_key, is_global, parts[0], parts[1], chat_id, thread_id)
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -1016,6 +1382,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not query or not query.data:
             return
         data = query.data
+        # Model selector flow — delegates all mdl:* actions to sub-handlers
+        if data.startswith("mdl:"):
+            await self._handle_model_callback(query)
+            return
+        # Update prompt flow — handles yes/no responses from send_update_prompt
         if not data.startswith("update_prompt:"):
             return
         answer = data.split(":", 1)[1]  # "y" or "n"
@@ -1680,6 +2051,50 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(message)
 
+    async def _handle_pending_model_input(self, update: "Update") -> bool:
+        """Consume the message if a model selection is awaiting manual text input.
+
+        Returns True if the message was consumed (caller should return immediately).
+        """
+        msg = update.message
+        if not msg or not msg.text:
+            return False
+        chat_id = str(msg.chat_id)
+        thread_id = self._msg_thread_id(msg)
+        state_key = self._selector_key(chat_id, thread_id)
+        state = self._model_selector_state.get(state_key, {})
+        if not state.get("awaiting_manual_input"):
+            return False
+
+        raw = msg.text.strip()
+        input_type = state.get("manual_input_type", "model_only")
+
+        if input_type == "provider_model":
+            if ":" in raw:
+                provider_slug, model_id = raw.split(":", 1)
+                provider_slug = provider_slug.strip()
+                model_id = model_id.strip()
+            else:
+                provider_slug, model_id = "", raw
+            back_target = "mdl:back:providers"
+        else:
+            provider_slug = state.get("models_provider", "")
+            model_id = raw
+            back_target = "mdl:back:models"
+
+        state["awaiting_manual_input"] = False
+        state.pop("manual_input_type", None)
+
+        text, kb = self._build_scope_keyboard(provider_slug, model_id, back_target=back_target)
+        await self._bot.send_message(
+            chat_id=int(chat_id),
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb,
+            message_thread_id=int(thread_id) if thread_id else None,
+        )
+        return True
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -1689,6 +2104,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not update.message or not update.message.text:
             return
+
+        if await self._handle_pending_model_input(update):
+            return
+
         if not self._should_process_message(update.message):
             return
 

@@ -1061,20 +1061,11 @@ class TelegramAdapter(BasePlatformAdapter):
         provider_label = get_label(current_provider) if current_provider else "none"
         header = f"Current: `{current_model or 'unknown'}` on {provider_label}\n\nSelect a provider:"
 
-        rows = []
-        row = []
-        for p in page_providers:
-            marker = " ✓" if p["is_current"] else ""
-            btn = InlineKeyboardButton(
-                f"{p['name']}{marker}",
-                callback_data=f"mdl:p:{p['slug']}",
-            )
-            row.append(btn)
-            if len(row) == 2:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
+        buttons = [
+            InlineKeyboardButton(f"{p['name']}{' ✓' if p['is_current'] else ''}", callback_data=f"mdl:p:{p['slug']}")
+            for p in page_providers
+        ]
+        rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
 
         nav_row = self._build_nav_row(page, total_pages, "mdl:providers:prev", "mdl:providers:next")
         if nav_row:
@@ -1122,6 +1113,7 @@ class TelegramAdapter(BasePlatformAdapter):
         page: int = 0, state: Optional[dict] = None,
     ) -> tuple:
         """Return (text, InlineKeyboardMarkup) for the model list of a provider, paginated."""
+        _back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀ Back", callback_data="mdl:back:providers")]])
         providers = state.get("providers") if state else None
         if providers is None:
             from hermes_cli.model_switch import list_authenticated_providers
@@ -1131,19 +1123,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     max_models=None,
                 )
             except Exception as e:
-                text = f"Failed to load providers: {e}"
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀ Back", callback_data="mdl:back:providers"),
-                ]])
-                return text, kb
+                return f"Failed to load providers: {e}", _back_kb
 
         provider = next((p for p in providers if p["slug"] == provider_slug), None)
         if not provider:
-            text = f"Provider `{provider_slug}` not found or no longer authenticated."
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀ Back", callback_data="mdl:back:providers"),
-            ]])
-            return text, kb
+            return f"Provider `{provider_slug}` not found or no longer authenticated.", _back_kb
 
         model_ids = provider["models"]
         total_models = len(model_ids)

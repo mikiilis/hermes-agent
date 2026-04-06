@@ -3481,7 +3481,7 @@ class GatewayRunner:
                     cfg = yaml.safe_load(f) or {}
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("name", "")
+                    current_model = model_cfg.get("default") or model_cfg.get("model") or ""
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
                 user_provs = cfg.get("providers")
@@ -3500,6 +3500,28 @@ class GatewayRunner:
 
         # No args: show authenticated providers with models
         if not model_input and not explicit_provider:
+            # On Telegram: show the interactive inline-keyboard selector
+            from gateway.config import Platform
+            if source.platform == Platform.TELEGRAM:
+                adapter = self.adapters.get(Platform.TELEGRAM)
+                if adapter and hasattr(adapter, "send_model_selector"):
+                    try:
+                        providers = list_authenticated_providers(
+                            current_provider=current_provider,
+                            user_providers=user_provs,
+                            max_models=None,
+                        )
+                        await adapter.send_model_selector(
+                            chat_id=source.chat_id,
+                            thread_id=source.thread_id,
+                            current_model=current_model,
+                            current_provider=current_provider,
+                            providers=providers,
+                        )
+                        return None
+                    except Exception as e:
+                        logger.warning("Telegram model selector failed, falling back to text: %s", e)
+
             provider_label = get_label(current_provider)
             lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", ""]
 

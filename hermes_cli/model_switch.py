@@ -682,7 +682,7 @@ def switch_model(
 def list_authenticated_providers(
     current_provider: str = "",
     user_providers: dict = None,
-    max_models: int = 8,
+    max_models: int | None = 8,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 

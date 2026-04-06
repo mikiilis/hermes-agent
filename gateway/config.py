@@ -530,6 +530,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["require_mention"] = platform_cfg["require_mention"]
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
+                if "reactions" in platform_cfg and isinstance(platform_cfg["reactions"], dict):
+                    bridged["reactions"] = platform_cfg["reactions"]
                 if not bridged:
                     continue
                 plat_data = platforms_data.setdefault(plat.value, {})

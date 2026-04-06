@@ -69,6 +69,65 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
+def test_commands_in_free_response_thread_accepted():
+    """Agent assigned to thread accepts commands without mention."""
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200:10"])
+    msg = SimpleNamespace(
+        **_group_message("/model", chat_id=-200).__dict__,
+        message_thread_id=10,
+    )
+    assert adapter._should_process_message(msg, is_command=True) is True
+
+
+def test_commands_in_foreign_free_response_thread_rejected():
+    """Agent with free_response_chats configured for a different thread rejects commands in unassigned thread."""
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200:99"])
+    msg = SimpleNamespace(
+        **_group_message("/model", chat_id=-200).__dict__,
+        message_thread_id=10,
+    )
+    assert adapter._should_process_message(msg, is_command=True) is False
+
+
+def test_free_text_in_assigned_thread_accepted():
+    """Thread-specific allowlist lets free text messages through without a mention."""
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200:10"])
+    msg = SimpleNamespace(
+        **_group_message("hello everyone", chat_id=-200).__dict__,
+        message_thread_id=10,
+    )
+    assert adapter._should_process_message(msg) is True
+
+
+def test_free_text_in_wrong_thread_rejected():
+    """Thread-specific allowlist does not grant access to messages from a different thread."""
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200:10"])
+    msg = SimpleNamespace(
+        **_group_message("hello everyone", chat_id=-200).__dict__,
+        message_thread_id=99,
+    )
+    assert adapter._should_process_message(msg) is False
+
+
+def test_chat_level_allowlist_grants_access_regardless_of_thread():
+    """A whole-chat entry in free_response_chats allows messages from any thread in that chat."""
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
+    msg_with_thread = SimpleNamespace(
+        **_group_message("hello everyone", chat_id=-200).__dict__,
+        message_thread_id=42,
+    )
+    msg_no_thread = _group_message("hello everyone", chat_id=-200)
+    assert adapter._should_process_message(msg_with_thread) is True
+    assert adapter._should_process_message(msg_no_thread) is True
+
+
+def test_thread_specific_allowlist_rejects_message_without_thread_id():
+    """A chat_id:thread_id entry does not match a plain (non-threaded) message in the same chat."""
+    adapter = _make_adapter(require_mention=True, free_response_chats=["-200:10"])
+    msg = _group_message("hello everyone", chat_id=-200)
+    assert adapter._should_process_message(msg) is False
+
+
 def test_regex_mention_patterns_allow_custom_wake_words():
     adapter = _make_adapter(require_mention=True, mention_patterns=[r"^\s*chompy\b"])
 

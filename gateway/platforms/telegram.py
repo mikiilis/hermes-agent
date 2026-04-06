@@ -2006,18 +2006,22 @@ class TelegramAdapter(BasePlatformAdapter):
         DMs remain unrestricted. Group/supergroup messages are accepted when:
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
-        - the message is a command
+        - the message is a command AND no ``free_response_chats`` are configured
+          (i.e. no thread-specific agent assignment is in effect)
         - the message replies to the bot
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
         """
         if not self._is_group_chat(message):
             return True
-        if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        thread_id = str(getattr(message, "message_thread_id", "")) if getattr(message, "message_thread_id", None) else ""
+        allowed = self._telegram_free_response_chats()
+        if chat_id in allowed or (thread_id and f"{chat_id}:{thread_id}" in allowed):
             return True
         if not self._telegram_require_mention():
             return True
-        if is_command:
+        if is_command and not allowed:
             return True
         if self._is_reply_to_bot(message):
             return True

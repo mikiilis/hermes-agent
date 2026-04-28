@@ -862,6 +862,11 @@ class MessageEvent:
     # Discord channel_skill_bindings).  A single name or ordered list.
     auto_skill: Optional[str | list[str]] = None
 
+    # Telegram group topic → Hermes profile routing.  Set when the inbound
+    # message hits a forum topic configured with `profile:` in
+    # platforms.telegram.extra.group_topics; None means use the host profile.
+    routed_profile: Optional[str] = None
+
     # Per-channel ephemeral system prompt (e.g. Discord channel_prompts).
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None

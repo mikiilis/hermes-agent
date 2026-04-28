@@ -199,6 +199,40 @@ def _wrap_markdown_tables(text: str) -> str:
     return '\n'.join(out)
 
 
+def find_group_topic_config(
+    extra: Dict[str, Any],
+    chat_id: Any,
+    thread_id: Any,
+) -> Optional[Dict[str, Any]]:
+    """Look up a Telegram group forum topic config entry.
+
+    Searches ``platforms.telegram.extra.group_topics[]`` for an entry whose
+    ``chat_id`` matches and whose ``topics[].thread_id`` matches.  Returns the
+    full topic dict (with ``name``, ``thread_id``, ``skill``, ``profile``,
+    etc.) or ``None`` if no match.  IDs are coerced via ``str(...)`` so YAML
+    int/string forms compare equal.
+    """
+    if not extra:
+        return None
+    group_topics_config = extra.get("group_topics") or []
+    if not isinstance(group_topics_config, list):
+        return None
+    chat_key = str(chat_id) if chat_id is not None else ""
+    thread_key = str(thread_id) if thread_id is not None else ""
+    for chat_entry in group_topics_config:
+        if not isinstance(chat_entry, dict):
+            continue
+        if str(chat_entry.get("chat_id", "")) != chat_key:
+            continue
+        for topic in chat_entry.get("topics") or []:
+            if not isinstance(topic, dict):
+                continue
+            tid = topic.get("thread_id")
+            if tid is not None and str(tid) == thread_key:
+                return topic
+    return None
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -3038,6 +3072,7 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id_str = self._GENERAL_TOPIC_THREAD_ID
         chat_topic = None
         topic_skill = None
+        routed_profile = None
 
         if chat_type == "dm" and thread_id_str:
             topic_info = self._get_dm_topic_info(str(chat.id), thread_id_str)
@@ -3054,17 +3089,22 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_topic = created_name
 
         elif chat_type == "group" and thread_id_str:
-            # Group/supergroup forum topic skill binding via config.extra['group_topics']
-            group_topics_config: list = self.config.extra.get("group_topics", [])
-            for chat_entry in group_topics_config:
-                if str(chat_entry.get("chat_id", "")) == str(chat.id):
-                    for topic in chat_entry.get("topics", []):
-                        tid = topic.get("thread_id")
-                        if tid is not None and str(tid) == thread_id_str:
-                            chat_topic = topic.get("name")
-                            topic_skill = topic.get("skill")
-                            break
-                    break
+            topic_cfg = find_group_topic_config(
+                self.config.extra, chat.id, thread_id_str
+            )
+            if topic_cfg:
+                chat_topic = topic_cfg.get("name")
+                topic_skill = topic_cfg.get("skill")
+                routed_profile = topic_cfg.get("profile")
+                if routed_profile and topic_skill:
+                    logger.warning(
+                        "[%s] Group topic chat_id=%s thread_id=%s has both "
+                        "profile=%s and skill=%s; profile takes precedence, "
+                        "skill ignored.",
+                        self.name, chat.id, thread_id_str,
+                        routed_profile, topic_skill,
+                    )
+                    topic_skill = None
 
         # Build source
         source = self.build_source(
@@ -3103,6 +3143,7 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,
+            routed_profile=routed_profile,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
         )

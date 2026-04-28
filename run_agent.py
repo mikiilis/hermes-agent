@@ -856,6 +856,8 @@ class AIAgent:
         verbose_logging: bool = False,
         quiet_mode: bool = False,
         ephemeral_system_prompt: str = None,
+        identity_prompt_override: str = None,
+        skip_host_soul: bool = False,
         log_prefix_chars: int = 100,
         log_prefix: str = "",
         providers_allowed: List[str] = None,
@@ -954,6 +956,23 @@ class AIAgent:
         self.verbose_logging = verbose_logging
         self.quiet_mode = quiet_mode
         self.ephemeral_system_prompt = ephemeral_system_prompt
+        # Profile-routed identity override: when non-empty, replaces the
+        # SOUL.md-from-disk content used as the system prompt's identity
+        # layer. The gateway sets this from the routed profile's SOUL.md
+        # so per-topic profile routing doesn't blend the host's persona
+        # with the routed one. Empty string is normalized to None so
+        # callers cannot accidentally erase the identity.
+        self.identity_prompt_override = (
+            identity_prompt_override if identity_prompt_override else None
+        )
+        # Suppress the host's ``SOUL.md`` from the identity layer when the
+        # gateway dispatches a routed-profile turn.  Without this, a profile
+        # that exists but has no ``SOUL.md`` would silently inherit the
+        # host's persona via ``load_soul_md()``.  When True, the identity
+        # falls back to ``DEFAULT_AGENT_IDENTITY`` instead — preserving
+        # profile isolation even for SOUL-less profiles.  Also suppresses
+        # SOUL injection through the context-files path.
+        self.skip_host_soul = bool(skip_host_soul)
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
         self._user_name = user_name
@@ -4553,9 +4572,25 @@ class AIAgent:
         #   6. Current date & time (frozen at build time)
         #   7. Platform-specific formatting hint
 
-        # Try SOUL.md as primary identity (unless context files are skipped)
+        # Try SOUL.md as primary identity (unless context files are skipped).
+        # Priority:
+        #   1. ``identity_prompt_override`` — set by the gateway when a
+        #      Telegram group topic routes to a non-host Hermes profile;
+        #      contains that profile's ``SOUL.md`` text.
+        #   2. ``skip_host_soul`` is False AND not ``skip_context_files``
+        #      — load the host's ``SOUL.md`` from ``HERMES_HOME``.
+        #   3. Fallback to ``DEFAULT_AGENT_IDENTITY``.
+        #
+        # ``skip_host_soul`` is the routing isolation guard: when the
+        # gateway dispatches to a non-host profile, we set this to True
+        # so a profile without its own ``SOUL.md`` falls back to the
+        # default identity instead of leaking the host's persona via
+        # ``load_soul_md()``.
         _soul_loaded = False
-        if not self.skip_context_files:
+        if self.identity_prompt_override:
+            prompt_parts = [self.identity_prompt_override]
+            _soul_loaded = True
+        elif not self.skip_context_files and not self.skip_host_soul:
             _soul_content = load_soul_md()
             if _soul_content:
                 prompt_parts = [_soul_content]
@@ -4667,7 +4702,9 @@ class AIAgent:
             # other dev files — inflating token usage by ~10k for no benefit.
             _context_cwd = os.getenv("TERMINAL_CWD") or None
             context_files_prompt = build_context_files_prompt(
-                cwd=_context_cwd, skip_soul=_soul_loaded)
+                cwd=_context_cwd,
+                skip_soul=_soul_loaded or self.skip_host_soul,
+            )
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 

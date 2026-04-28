@@ -573,6 +573,7 @@ def build_session_key(
     source: SessionSource,
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
+    profile_name: Optional[str] = None,
 ) -> str:
     """Build a deterministic session key from a message source.
 
@@ -596,7 +597,15 @@ def build_session_key(
       - Without participant identifiers, or when isolation is disabled, messages fall back to one
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
+
+    Profile routing:
+      - When ``profile_name`` is provided (non-empty), the ``"agent:main"``
+        prefix is replaced with ``f"agent:profile:{profile_name}"`` so traffic
+        routed to a non-host Hermes profile gets isolated session keys.
+      - ``profile_name=None`` (or empty) preserves byte-for-byte compatibility
+        with existing transcripts; the host profile must always pass ``None``.
     """
+    prefix = f"agent:profile:{profile_name}" if profile_name else "agent:main"
     platform = source.platform.value
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
@@ -605,11 +614,11 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"agent:main:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"agent:main:{platform}:dm:{dm_chat_id}"
+                return f"{prefix}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
+            return f"{prefix}:{platform}:dm:{dm_chat_id}"
         if source.thread_id:
-            return f"agent:main:{platform}:dm:{source.thread_id}"
-        return f"agent:main:{platform}:dm"
+            return f"{prefix}:{platform}:dm:{source.thread_id}"
+        return f"{prefix}:{platform}:dm"
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -617,7 +626,7 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = ["agent:main", platform, source.chat_type]
+    key_parts = [prefix, platform, source.chat_type]
 
     if source.chat_id:
         key_parts.append(source.chat_id)
@@ -713,12 +722,22 @@ class SessionStore:
                 logger.debug("Could not remove temp file %s: %s", tmp_path, e)
             raise
     
-    def _generate_session_key(self, source: SessionSource) -> str:
-        """Generate a session key from a source."""
+    def _generate_session_key(
+        self,
+        source: SessionSource,
+        profile_name: Optional[str] = None,
+    ) -> str:
+        """Generate a session key from a source.
+
+        ``profile_name`` is forwarded to :func:`build_session_key` so callers
+        on the routed-profile dispatch path get profile-prefixed keys without
+        affecting host-profile traffic (which always passes ``None``).
+        """
         return build_session_key(
             source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            profile_name=profile_name,
         )
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
@@ -828,15 +847,21 @@ class SessionStore:
     def get_or_create_session(
         self,
         source: SessionSource,
-        force_new: bool = False
+        force_new: bool = False,
+        profile_name: Optional[str] = None,
     ) -> SessionEntry:
         """
         Get an existing session or create a new one.
 
         Evaluates reset policy to determine if the existing session is stale.
         Creates a session record in SQLite when a new session starts.
+
+        ``profile_name`` is forwarded to :meth:`_generate_session_key` so
+        Telegram group topics that route to a non-host Hermes profile produce
+        profile-prefixed session keys (and therefore distinct ``SessionEntry``
+        / agent cache slots) without affecting host-profile traffic.
         """
-        session_key = self._generate_session_key(source)
+        session_key = self._generate_session_key(source, profile_name=profile_name)
         now = _now()
 
         # SQLite calls are made outside the lock to avoid holding it during I/O.

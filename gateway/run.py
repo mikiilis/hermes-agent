@@ -29,7 +29,10 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gateway.profile_runtime import ProfileRuntime
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 
@@ -748,6 +751,37 @@ class GatewayRunner:
         except Exception as e:
             logger.debug("SQLite session store not available: %s", e)
 
+        # Per-profile runtime registry for Telegram group-topic profile
+        # routing.  The host profile (whatever the gateway was launched as)
+        # is registered here with the gateway-owned shared session_db; routed
+        # profiles get their own SessionDB handles loaded lazily on first
+        # access.  See gateway/profile_runtime.py for the rationale (we do
+        # NOT mutate os.environ["HERMES_HOME"] per message).
+        try:
+            from gateway.profile_runtime import (
+                ProfileRuntimeRegistry,
+                build_host_runtime,
+                read_profile_text,
+            )
+            from hermes_cli.profiles import get_active_profile_name
+            _host_name = get_active_profile_name() or "default"
+            _host_soul = read_profile_text(_hermes_home / "SOUL.md")
+            self._profile_registry = ProfileRuntimeRegistry(
+                build_host_runtime(
+                    name=_host_name,
+                    home=_hermes_home,
+                    session_db=self._session_db,
+                    soul_prompt=_host_soul,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "ProfileRuntimeRegistry unavailable; group-topic profile "
+                "routing will fall back to host profile only: %s",
+                exc,
+            )
+            self._profile_registry = None
+
         # Opportunistic state.db maintenance: prune ended sessions older
         # than sessions.retention_days + optional VACUUM. Tracks last-run
         # in state_meta so it only actually executes once per
@@ -1013,11 +1047,24 @@ class GatewayRunner:
     def exit_code(self) -> Optional[int]:
         return self._exit_code
 
-    def _session_key_for_source(self, source: SessionSource) -> str:
-        """Resolve the current session key for a source, honoring gateway config when available."""
+    def _session_key_for_source(
+        self,
+        source: SessionSource,
+        profile_name: Optional[str] = None,
+    ) -> str:
+        """Resolve the current session key for a source, honoring gateway config when available.
+
+        ``profile_name`` is set only by the dispatch path when a Telegram
+        group topic routes to a non-host Hermes profile (see
+        ``MessageEvent.routed_profile``).  Out-of-band callers (e.g.,
+        ``/reasoning``) leave it ``None`` so they continue to address the
+        host-profile session key.
+        """
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
-                session_key = self.session_store._generate_session_key(source)
+                session_key = self.session_store._generate_session_key(
+                    source, profile_name=profile_name,
+                )
                 if isinstance(session_key, str) and session_key:
                     return session_key
             except Exception:
@@ -1027,6 +1074,7 @@ class GatewayRunner:
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            profile_name=profile_name,
         )
 
     def _resolve_session_agent_runtime(
@@ -2967,6 +3015,17 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("SessionDB close error: %s", _e)
 
+            # Close per-profile state.db handles opened for routed
+            # group-topic traffic.  Host runtime's session_db is the
+            # gateway-owned handle and is not closed here (the loop above
+            # already handled it via self._db / session_store._db).
+            _registry = getattr(self, "_profile_registry", None)
+            if _registry is not None:
+                try:
+                    _registry.shutdown()
+                except Exception as _e:
+                    logger.debug("ProfileRuntimeRegistry.shutdown error: %s", _e)
+
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
             release_gateway_runtime_lock()
@@ -4411,8 +4470,39 @@ class GatewayRunner:
             source.chat_id or "unknown", _msg_preview,
         )
 
+        # Resolve the Hermes profile this message routes to.  ``None`` /
+        # missing-profile fallbacks both yield the host runtime so existing
+        # traffic is byte-for-byte identical.
+        _routed_profile_name = getattr(event, "routed_profile", None)
+        _registry = getattr(self, "_profile_registry", None)
+        profile_runtime = (
+            _registry.get(_routed_profile_name) if _registry is not None else None
+        )
+        if _routed_profile_name and profile_runtime is not None:
+            # Always log when the topic *requested* a profile so operators
+            # can distinguish "routed correctly" from "fell back to host"
+            # (the registry warns once on first miss; this trace fires per
+            # turn).
+            logger.debug(
+                "Dispatch routing: requested=%s resolved=%s is_host=%s "
+                "chat=%s thread=%s",
+                _routed_profile_name, profile_runtime.name,
+                profile_runtime.is_host,
+                source.chat_id, source.thread_id,
+            )
+        # Profile name to feed into session-key construction: only set when
+        # the resolved runtime is a non-host profile.  This keeps host
+        # traffic on the legacy ``agent:main:`` prefix.
+        _session_profile_name = (
+            profile_runtime.name
+            if profile_runtime is not None and not profile_runtime.is_host
+            else None
+        )
+
         # Get or create session
-        session_entry = self.session_store.get_or_create_session(source)
+        session_entry = self.session_store.get_or_create_session(
+            source, profile_name=_session_profile_name,
+        )
         session_key = session_entry.session_key
         if getattr(session_entry, "was_auto_reset", False):
             # Treat auto-reset as a full conversation boundary — drop every
@@ -4904,6 +4994,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                profile_runtime=profile_runtime,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8869,6 +8960,7 @@ class GatewayRunner:
         runtime: dict,
         enabled_toolsets: list,
         ephemeral_prompt: str,
+        identity_prompt: str = "",
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -8876,6 +8968,11 @@ class GatewayRunner:
         discarded and rebuilt.  When it stays the same, the cached agent is
         reused — preserving the frozen system prompt and tool schemas for
         prompt cache hits.
+
+        ``identity_prompt`` participates in the signature so that switching
+        a routed Telegram topic from one Hermes profile to another between
+        turns invalidates the cached agent (the SOUL changes, so the system
+        prompt's identity layer changes too).
         """
         import hashlib, json as _j
 
@@ -8897,6 +8994,7 @@ class GatewayRunner:
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
+                identity_prompt or "",
             ],
             sort_keys=True,
             default=str,
@@ -9565,6 +9663,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        profile_runtime: "Optional[ProfileRuntime]" = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -9598,8 +9697,23 @@ class GatewayRunner:
             if run_generation is None or not session_key:
                 return True
             return self._is_session_run_current(session_key, run_generation)
-        
-        user_config = _load_gateway_config()
+
+        # When the message routes to a non-host profile, derive the model,
+        # toolset selection, and SOUL prompt from that profile's loaded
+        # config — never mutate ``os.environ["HERMES_HOME"]`` for routing.
+        # ``profile_runtime`` is None for legacy traffic, in which case the
+        # host's gateway config is used as before.
+        _is_routed = (
+            profile_runtime is not None and not profile_runtime.is_host
+        )
+        if _is_routed:
+            user_config = profile_runtime.config or _load_gateway_config()
+            _routed_session_db = profile_runtime.session_db
+            _routed_soul_prompt = profile_runtime.soul_prompt
+        else:
+            user_config = _load_gateway_config()
+            _routed_session_db = self._session_db
+            _routed_soul_prompt = None
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
@@ -10007,6 +10121,11 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            # The routed profile's SOUL.md is now passed to AIAgent as
+            # ``identity_prompt_override`` (see below) instead of being
+            # prepended here. That puts it in the system prompt's identity
+            # slot, replacing the host's load_soul_md() read — without it,
+            # the agent would see *both* personas.
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart).
@@ -10149,6 +10268,7 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
+                identity_prompt=_routed_soul_prompt or "",
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -10178,6 +10298,12 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     ephemeral_system_prompt=combined_ephemeral or None,
+                    identity_prompt_override=_routed_soul_prompt or None,
+                    # Suppress host SOUL.md fall-through for any non-host
+                    # profile turn, even if that profile has no SOUL.md of
+                    # its own.  Without this, a routed profile without a
+                    # SOUL would silently inherit the host's persona.
+                    skip_host_soul=_is_routed,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
@@ -10197,7 +10323,7 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
-                    session_db=self._session_db,
+                    session_db=_routed_session_db,
                     fallback_model=self._fallback_model,
                 )
                 if _cache_lock and _cache is not None:

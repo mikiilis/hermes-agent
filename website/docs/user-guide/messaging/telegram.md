@@ -380,17 +380,23 @@ For example, a topic with `skill: arxiv` will have the arxiv skill pre-loaded wh
 Topics created outside of the config (e.g., by manually calling the Telegram API) are discovered automatically when a `forum_topic_created` service message arrives. You can also add topics to the config while the gateway is running — they'll be picked up on the next cache miss.
 :::
 
-## Group Forum Topic Skill Binding
+## Group Forum Topic Skill & Profile Binding
 
-Supergroups with **Topics mode** enabled (also called "forum topics") already get session isolation per topic — each `thread_id` maps to its own conversation. But you may want to **auto-load a skill** when messages arrive in a specific group topic, just like DM topic skill binding works.
+Supergroups with **Topics mode** enabled (also called "forum topics") already get session isolation per topic — each `thread_id` maps to its own conversation. You can also bind topics to **skills** (auto-loaded on new sessions) or to **Hermes profiles** (each topic answered by a different agent with its own model, SOUL, memory, and `state.db`).
 
-### Use case
+### Use cases
 
 A team supergroup with forum topics for different workstreams:
 
 - **Engineering** topic → auto-loads the `software-development` skill
 - **Research** topic → auto-loads the `arxiv` skill
 - **General** topic → no skill, general-purpose assistant
+
+A personal supergroup where one bot fronts several distinct assistants:
+
+- **Microgreens** topic → routed to the `phyllis` profile (gardening persona, claude-opus, gardening memory)
+- **Swedish** topic → routed to the `swedish-tutor` profile (language-tutor persona, separate memory)
+- **General** topic → host (default) profile, no routing
 
 ### Configuration
 
@@ -403,15 +409,20 @@ platforms:
       group_topics:
       - chat_id: -1001234567890       # Supergroup ID
         topics:
-        - name: Engineering
+        # Profile routing — each topic gets its own Hermes profile
+        - name: Microgreens
           thread_id: 5
-          skill: software-development
-        - name: Research
+          profile: phyllis
+        - name: Swedish
           thread_id: 12
-          skill: arxiv
+          profile: swedish-tutor
+        # Legacy skill binding — still works exactly as before
+        - name: Engineering
+          thread_id: 20
+          skill: software-development
         - name: General
           thread_id: 1
-          # No skill — general purpose
+          # No skill, no profile — host profile, general purpose
 ```
 
 **Fields:**
@@ -422,13 +433,17 @@ platforms:
 | `name` | No | Human-readable label for the topic (informational only) |
 | `thread_id` | Yes | Telegram forum topic ID — visible in `t.me/c/<group_id>/<thread_id>` links |
 | `skill` | No | Skill to auto-load on new sessions in this topic |
+| `profile` | No | Hermes profile to route this topic to. Profile must exist under `~/.hermes/profiles/<name>/`. Takes precedence over `skill` when both are set. |
 
 ### How it works
 
-1. When a message arrives in a mapped group topic, Hermes looks up the `chat_id` and `thread_id` in `group_topics` config
-2. If a matching entry has a `skill` field, that skill is auto-loaded for the session — identical to DM topic skill binding
-3. Topics without a `skill` key get session isolation only (existing behavior, unchanged)
-4. Unmapped `thread_id` values or `chat_id` values fall through silently — no error, no skill
+1. When a message arrives in a mapped group topic, Hermes looks up the `chat_id` and `thread_id` in `group_topics` config.
+2. **If `profile` is set:** the topic is dispatched to that Hermes profile's runtime — its `config.yaml` (model, provider, toolsets), its `SOUL.md` (system prompt), and its own `state.db` (transcripts, memory). Session keys for routed topics are prefixed `agent:profile:<name>:...` instead of `agent:main:...`, so each profile's history is fully isolated even within the same supergroup.
+3. **If only `skill` is set:** that skill is auto-loaded for the session — identical to DM topic skill binding. The host profile handles the conversation.
+4. **If both `profile` and `skill` are set:** `profile` wins, `skill` is ignored, and a `WARNING` is logged so the operator notices the redundant config. (The expectation is that the routed profile's own `config.yaml` already lists the skills it needs.)
+5. Topics with neither `profile` nor `skill` get session isolation only (existing behavior, unchanged).
+6. Unmapped `thread_id` values or `chat_id` values fall through silently — no error, no routing.
+7. **Missing profile:** if `profile` names a directory that doesn't exist under `~/.hermes/profiles/`, Hermes logs a `WARNING` and falls back to the host profile so the topic keeps responding. Watch the gateway log on startup and after config changes to catch typos.
 
 ### Differences from DM Topics
 
@@ -439,6 +454,7 @@ platforms:
 | `thread_id` | Auto-populated after creation | Must be set manually |
 | `icon_color` / `icon_custom_emoji_id` | Supported | Not applicable (admin controls appearance) |
 | Skill binding | ✓ | ✓ |
+| Profile routing | ✗ | ✓ |
 | Session isolation | ✓ | ✓ (already built-in for forum topics) |
 
 :::tip
